@@ -1,6 +1,7 @@
 class Context {
   code = "";
   scopes = [["vars"]];
+  staticPathScopes: string[][] = [[]];
   bitFields: Parser[] = [];
   tmpVariableCount = 0;
   references = new Map<string, { resolved: boolean; requested: boolean }>();
@@ -8,6 +9,7 @@ class Context {
   imports: any[] = [];
   reverseImports = new Map<any, number>();
   useContextVariables = false;
+  useBounds = false;
 
   constructor(importPath: string, useContextVariables: boolean) {
     this.importPath = importPath;
@@ -38,6 +40,178 @@ class Context {
     this.pushCode(`throw new Error(${err});`);
   }
 
+  /**
+   * Runtime path helpers. `$path` is an array of literal segments such as
+   * ".body" and dynamic segments such as "[0]". Pushing always happens right
+   * before the generated region and every push has a matching pop inside a
+   * `finally` block, so thrown errors can never leave a polluted path.
+   */
+  pushRuntimePath(segment: string) {
+    if (!this.useBounds) {
+      return;
+    }
+    this.pushCode(`$pushPath(${segment});`);
+  }
+
+  popRuntimePath() {
+    if (!this.useBounds) {
+      return;
+    }
+    this.pushCode(`$popPath();`);
+  }
+
+  pushStaticPath(name: string) {
+    if (name) {
+      this.staticPathScopes[this.staticPathScopes.length - 1].push(name);
+    }
+  }
+
+  popStaticPath(name: string) {
+    if (name) {
+      this.staticPathScopes[this.staticPathScopes.length - 1].pop();
+    }
+  }
+
+  generatePathExpression(): string {
+    return `$pathString()`;
+  }
+
+  /**
+   * Throw a bounded-range error. `reason` is a JS string expression; the
+   * field path, absolute offset, active frame range and consumed byte count
+   * are attached both to the message and to the error object.
+   */
+  boundsError(reason: string, extra?: string) {
+    this.pushCode(
+      `$boundedError(${reason}, ${this.generatePathExpression()}, offset, ` +
+        `${extra || ""});`,
+    );
+  }
+
+  boundsErrorAt(
+    pathExpr: string,
+    offsetExpr: string,
+    reason: string,
+    extra?: string,
+  ) {
+    this.pushCode(
+      `$boundedError(${reason}, ${pathExpr}, ${offsetExpr}, ${extra || ""});`,
+    );
+  }
+
+  /**
+   * Assert that the half-open range [offset, offset + size) is fully inside
+   * the active bounded frame (or the whole buffer at the top level).
+   */
+  boundsCheckRange(size: string) {
+    this.pushCode(
+      `$checkRange(offset, ${size}, ${this.generatePathExpression()});`,
+    );
+  }
+
+  /**
+   * Assert that a pointer target `target` (an absolute offset) is inside the
+   * active bounded frame.
+   */
+  boundsCheckPointer(target: string) {
+    this.pushCode(
+      `$checkPointer(${target}, ${this.generatePathExpression()});`,
+    );
+  }
+
+  /**
+   * Emit the runtime helpers shared by all bounded frames. Emitted at most
+   * once per generated function and only when any bounded frame is present.
+   */
+  emitBoundsHelpers() {
+    this.pushCode(`
+var $frames = [];
+var $path = [];
+function $pushPath($segment) {
+  $path.push($segment);
+}
+function $popPath() {
+  $path.pop();
+}
+function $pathString() {
+  return $path.length ? $path.join("") : "<root>";
+}
+function $frameBase() {
+  return $frames.length ? $frames[$frames.length - 1][0] : 0;
+}
+function $frameEnd() {
+  return $frames.length
+    ? $frames[$frames.length - 1][1]
+    : buffer.length;
+}
+function $boundedError(reason, $errPath, $errOffset, $errConsumed) {
+  var $base = $frameBase();
+  var $end = $frameEnd();
+  var $message =
+    "Bounded parse error at " + ($errPath || "<root>") + ": " + reason +
+    " (offset " + $errOffset + ", range [" + $base + ", " + $end + ")" +
+    ($errConsumed === undefined || $errConsumed === null
+      ? ""
+      : ", consumed " + $errConsumed);
+  var $error = new Error($message);
+  $error.$boundedAnnotated = true;
+  $error.fieldPath = $errPath;
+  $error.offset = $errOffset;
+  $error.rangeStart = $base;
+  $error.rangeEnd = $end;
+  if ($errConsumed !== undefined && $errConsumed !== null) {
+    $error.consumed = $errConsumed;
+  }
+  throw $error;
+}
+function $checkRange($readOffset, $readSize, $errPath) {
+  var $end = $frameEnd();
+  if (
+    $readOffset < $frameBase() ||
+    $readSize < 0 ||
+    $readOffset + $readSize > $end
+  ) {
+    $boundedError(
+      "read of " + $readSize + " byte(s) out of bounds",
+      $errPath,
+      $readOffset,
+      $readOffset - $frameBase()
+    );
+  }
+}
+function $checkPointer($target, $errPath) {
+  if ($target < $frameBase() || $target >= $frameEnd()) {
+    $boundedError(
+      "pointer target " + $target + " is outside the bounded frame",
+      $errPath,
+      $target
+    );
+  }
+}
+function $annotateBounded($fn) {
+  try {
+    return $fn();
+  } catch ($err) {
+    if ($err && typeof $err === "object" && !$err.$boundedAnnotated) {
+      $err.$boundedAnnotated = true;
+      var $base = $frameBase();
+      var $end = $frameEnd();
+      $err.fieldPath = ${this.generatePathExpression()};
+      if ($err.rangeStart === undefined) $err.rangeStart = $base;
+      if ($err.rangeEnd === undefined) $err.rangeEnd = $end;
+      $err.offset = offset;
+      $err.consumed = offset - $base;
+      $err.message =
+        $err.message +
+        " (field " + $err.fieldPath + ", offset " + offset +
+        ", range [" + $base + ", " + $end + "], consumed " +
+        (offset - $base) + ")";
+    }
+    throw $err;
+  }
+}`);
+  }
+
   generateTmpVariable(): string {
     return "$tmp" + this.tmpVariableCount++;
   }
@@ -49,21 +223,39 @@ class Context {
   pushPath(name: string) {
     if (name) {
       this.scopes[this.scopes.length - 1].push(name);
+      this.staticPathScopes[this.staticPathScopes.length - 1].push(name);
     }
   }
 
   popPath(name: string) {
     if (name) {
       this.scopes[this.scopes.length - 1].pop();
+      this.staticPathScopes[this.staticPathScopes.length - 1].pop();
     }
   }
 
   pushScope(name: string) {
     this.scopes.push([name]);
+    this.staticPathScopes.push([]);
   }
 
   popScope() {
     this.scopes.pop();
+    this.staticPathScopes.pop();
+  }
+
+  /**
+   * Dotted field path at code-generation time (e.g. ".box.items"). Unlike
+   * the runtime `$path` stack it cannot include array indices, but it is
+   * available while emitting error checks, before any runtime unwinding.
+   */
+  staticPathString(suffix = ""): string {
+    const segments: string[] = [];
+    for (const scope of this.staticPathScopes) {
+      segments.push(...scope);
+    }
+    const joined = segments.map((seg) => "." + seg).join("");
+    return joined + suffix;
   }
 
   addImport(im: any): string {
@@ -127,7 +319,31 @@ interface ParserOptions {
   key?: string;
   tag?: string | ((item: any) => number);
   offset?: number | string | ((item: any) => number);
+  relative?: boolean;
   wrapper?: (buffer: Buffer) => Buffer;
+  bounds?: number | string | BoundsLengthCallback | BoundsOptions;
+  consume?: BoundsConsumeMode;
+  trailing?: string;
+}
+
+/**
+ * - "exact" (default): the inner parser must consume the whole frame.
+ * - "allow-trailing": unconsumed bytes are silently skipped.
+ * - "keep-trailing": unconsumed bytes are stored in the given field.
+ */
+export type BoundsConsumeMode = "exact" | "allow-trailing" | "keep-trailing";
+
+/**
+ * Return value of a bounded frame length callback. It receives the object
+ * parsed so far (the same object `this` refers to in other callbacks) and
+ * must return a non-negative safe integer.
+ */
+export type BoundsLengthCallback = (item: any) => number;
+
+export interface BoundsOptions {
+  length: number | string | BoundsLengthCallback;
+  consume?: BoundsConsumeMode;
+  trailing?: string;
 }
 
 type Types = PrimitiveTypes | ComplexTypes;
@@ -139,6 +355,7 @@ type ComplexTypes =
   | "array"
   | "choice"
   | "nest"
+  | "bounded"
   | "seek"
   | "pointer"
   | "saveOffset"
@@ -319,12 +536,16 @@ export class Parser {
   private primitiveGenerateN(type: PrimitiveTypes, ctx: Context) {
     const typeName = PRIMITIVE_NAMES[type];
     const littleEndian = PRIMITIVE_LITTLE_ENDIANS[type];
+    const size = PRIMITIVE_SIZES[type];
+    if (ctx.useBounds) {
+      ctx.boundsCheckRange(String(size));
+    }
     ctx.pushCode(
       `${ctx.generateVariable(
         this.varName,
       )} = dataView.get${typeName}(offset, ${littleEndian});`,
     );
-    ctx.pushCode(`offset += ${PRIMITIVE_SIZES[type]};`);
+    ctx.pushCode(`offset += ${size};`);
   }
 
   private primitiveN(
@@ -750,6 +971,87 @@ export class Parser {
     return this.setNextParser("pointer", varName, options);
   }
 
+  /**
+   * Parse `type` inside a declarative bounded sub-range. The range starts at
+   * the current offset and spans `options.bounds` bytes. Length can be a
+   * constant, the name of a previously parsed field, or a callback
+   * `(vars) => number` which must return a non-negative safe integer.
+   *
+   * The inner parser is generated inline (no buffer slicing) and every read
+   * it performs, including absolute and relative pointers, is constrained to
+   * the frame. When the frame is exited the parent bounds are restored.
+   *
+   * `consume` controls trailing bytes:
+   * - "exact" (default): the inner parser must consume exactly the frame.
+   * - "allow-trailing": remaining bytes are skipped.
+   * - "keep-trailing": remaining bytes are stored in `options.trailing`.
+   */
+  bounded(varName: string | ParserOptions, options?: ParserOptions): this {
+    if (typeof options !== "object" && typeof varName === "object") {
+      options = varName;
+      varName = "";
+    }
+
+    if (!options || options.bounds === undefined) {
+      throw new Error("bounds is required for bounded.");
+    }
+
+    if (!options.type) {
+      throw new Error("type is required for bounded.");
+    }
+
+    if (!(options.type instanceof Parser) && !aliasRegistry.has(options.type)) {
+      throw new Error("type must be a known parser name or a Parser object.");
+    }
+
+    if (!(options.type instanceof Parser) && !varName) {
+      throw new Error(
+        "type must be a Parser object if the variable name is omitted.",
+      );
+    }
+
+    const bounds = options.bounds;
+    if (typeof bounds === "object") {
+      if (
+        typeof bounds.length !== "number" &&
+        typeof bounds.length !== "string" &&
+        typeof bounds.length !== "function"
+      ) {
+        throw new Error("bounds.length is required for bounded.");
+      }
+
+      const consume = bounds.consume ?? "exact";
+      if (
+        consume !== "exact" &&
+        consume !== "allow-trailing" &&
+        consume !== "keep-trailing"
+      ) {
+        throw new Error(
+          'consume must be one of "exact", "allow-trailing" or "keep-trailing".',
+        );
+      }
+      options.consume = consume;
+
+      if (consume === "keep-trailing" && !bounds.trailing) {
+        throw new Error(
+          'trailing field name is required when consume is "keep-trailing".',
+        );
+      }
+      options.trailing = bounds.trailing;
+      options.bounds = bounds.length;
+    } else if (
+      typeof bounds !== "number" &&
+      typeof bounds !== "string" &&
+      typeof bounds !== "function"
+    ) {
+      throw new Error(
+        "bounds must be a number, a string, a function or an options object.",
+      );
+    }
+
+    return this.setNextParser("bounded", varName as string, options);
+  }
+
   saveOffset(varName: string, options: ParserOptions = {}): this {
     return this.setNextParser("saveOffset", varName, options);
   }
@@ -791,6 +1093,10 @@ export class Parser {
 
   private getContext(importPath: string): Context {
     const ctx = new Context(importPath, this.useContextVariables);
+    ctx.useBounds = this.usesBounds();
+    if (ctx.useBounds) {
+      ctx.emitBoundsHelpers();
+    }
 
     ctx.pushCode(
       "var dataView = new DataView(buffer.buffer, buffer.byteOffset, buffer.length);",
@@ -800,7 +1106,15 @@ export class Parser {
       this.addRawCode(ctx);
     } else {
       this.addAliasedCode(ctx);
-      ctx.pushCode(`return ${FUNCTION_PREFIX + this.alias}(0).result;`);
+      if (ctx.useBounds) {
+        ctx.pushCode(
+          `return ${
+            FUNCTION_PREFIX + this.alias
+          }(0, undefined, $frames, $path).result;`,
+        );
+      } else {
+        ctx.pushCode(`return ${FUNCTION_PREFIX + this.alias}(0).result;`);
+      }
     }
 
     return ctx;
@@ -809,6 +1123,55 @@ export class Parser {
   getCode(): string {
     const importPath = "imports";
     return this.getContext(importPath).code;
+  }
+
+  /**
+   * Walk the parser chain (including inline sub-parsers and registered
+   * aliases) to detect whether any bounded frame is used. When false the
+   * generated code stays byte-for-byte identical to a parser without this
+   * feature.
+   */
+  private usesBounds(seen: Set<Parser> = new Set()): boolean {
+    let node: Parser | undefined = this.next ?? this;
+    while (node) {
+      if (seen.has(node)) {
+        return false;
+      }
+      seen.add(node);
+
+      if (node.type === "bounded") {
+        return true;
+      }
+
+      const options = node.options;
+      const inlineTypes: unknown[] = [
+        options.type,
+        ...Object.values(options.choices || {}),
+        options.defaultChoice,
+      ];
+      for (const candidate of inlineTypes) {
+        if (candidate instanceof Parser && candidate.usesBounds(seen)) {
+          return true;
+        }
+      }
+
+      const aliasNames = [options.type].concat(
+        Object.values(options.choices || {}).filter(
+          (candidate): candidate is string => typeof candidate === "string",
+        ),
+      );
+      for (const aliasName of aliasNames) {
+        if (typeof aliasName === "string" && aliasRegistry.has(aliasName)) {
+          const aliased = aliasRegistry.get(aliasName);
+          if (aliased && aliased.usesBounds(seen)) {
+            return true;
+          }
+        }
+      }
+
+      node = node.next;
+    }
+    return false;
   }
 
   private addRawCode(ctx: Context) {
@@ -830,7 +1193,19 @@ export class Parser {
   }
 
   private addAliasedCode(ctx: Context) {
-    ctx.pushCode(`function ${FUNCTION_PREFIX + this.alias}(offset, context) {`);
+    if (ctx.useBounds) {
+      ctx.pushCode(
+        `function ${
+          FUNCTION_PREFIX + this.alias
+        }(offset, context, $frames, $path) {`,
+      );
+      ctx.pushCode(`$frames = $frames || [];`);
+      ctx.pushCode(`$path = $path || [];`);
+    } else {
+      ctx.pushCode(
+        `function ${FUNCTION_PREFIX + this.alias}(offset, context) {`,
+      );
+    }
     ctx.pushCode(
       `var vars = ${this.constructorFn ? "new constructorFn()" : "{}"};`,
     );
@@ -911,6 +1286,13 @@ export class Parser {
       // if this is a nested parser
     } else if (this.type === "nest") {
       size = (this.options.type as Parser).sizeOf();
+      // if this is a bounded frame, its static size (when known) is the
+      // declared frame length, regardless of what the inner parser claims.
+    } else if (
+      this.type === "bounded" &&
+      typeof this.options.bounds === "number"
+    ) {
+      size = this.options.bounds;
     } else if (!this.type) {
       size = 0;
     }
@@ -955,6 +1337,33 @@ export class Parser {
 
   // Call code generator for this parser
   private generate(ctx: Context) {
+    const tracksRuntimePath =
+      this.type !== "" &&
+      this.type !== "bit" &&
+      this.type !== "seek" &&
+      this.type !== "saveOffset";
+    // bounded installs its own try/catch that annotates with the frame's
+    // range; it must not additionally be wrapped by $annotateBounded, whose
+    // function scope would shadow the hoisted $frames/$path state.
+    const usesAnnotateWrapper = tracksRuntimePath && this.type !== "bounded";
+    // nest and bounded already push the static path themselves around the
+    // inlined sub-parser (their variables live in a nested scope).
+    const pushesStaticPath = this.type !== "nest" && this.type !== "bounded";
+    if (ctx.useBounds && this.varName && tracksRuntimePath) {
+      // Every named field (except pure offsets) pushes its name for the
+      // duration of its generated region; the matching pop in `finally`
+      // guarantees exceptions can never leave a polluted runtime path.
+      if (pushesStaticPath) {
+        ctx.pushStaticPath(this.varName);
+      }
+      ctx.pushRuntimePath(JSON.stringify("." + this.varName));
+      ctx.pushCode(`try {`);
+      if (usesAnnotateWrapper) {
+        // Errors thrown by reads/asserts/formatters of this exact field are
+        // annotated with the field path while it is still on the stack.
+        ctx.pushCode(`$annotateBounded(function () {`);
+      }
+    }
     if (this.type) {
       switch (this.type) {
         case "uint8":
@@ -992,6 +1401,9 @@ export class Parser {
         case "nest":
           this.generateNest(ctx);
           break;
+        case "bounded":
+          this.generateBounded(ctx);
+          break;
         case "array":
           this.generateArray(ctx);
           break;
@@ -1014,6 +1426,18 @@ export class Parser {
     const varName = ctx.generateVariable(this.varName);
     if (this.options.formatter && this.type !== "bit") {
       this.generateFormatter(ctx, varName, this.options.formatter);
+    }
+
+    if (ctx.useBounds && this.varName && tracksRuntimePath) {
+      if (usesAnnotateWrapper) {
+        ctx.pushCode(`});`);
+      }
+      ctx.pushCode(`} finally {`);
+      ctx.popRuntimePath();
+      ctx.pushCode(`}`);
+      if (pushesStaticPath) {
+        ctx.popStaticPath(this.varName);
+      }
     }
 
     return this.generateNext(ctx);
@@ -1137,6 +1561,21 @@ export class Parser {
       let sum = 0;
       let rem = 0;
 
+      if (ctx.useBounds) {
+        const bitSize = ctx.bitFields.reduce(
+          (total, field) => total + (field.options.length as number),
+          0,
+        );
+        const firstNamed = ctx.bitFields.find((field) => field.varName);
+        if (firstNamed) {
+          ctx.pushRuntimePath(JSON.stringify("." + firstNamed.varName));
+        }
+        ctx.boundsCheckRange(String(Math.ceil(bitSize / 8)));
+        if (firstNamed) {
+          ctx.popRuntimePath();
+        }
+      }
+
       ctx.bitFields.forEach((parser, i) => {
         let length = parser.options.length as number;
         if (length > rem) {
@@ -1188,6 +1627,11 @@ export class Parser {
 
   private generateSeek(ctx: Context) {
     const length = ctx.generateOption(this.options.length!);
+    if (ctx.useBounds) {
+      ctx.pushCode(
+        `$checkRange(offset, ${length}, ${ctx.generatePathExpression()});`,
+      );
+    }
     ctx.pushCode(`offset += ${length};`);
   }
 
@@ -1201,6 +1645,9 @@ export class Parser {
     if (this.options.length && this.options.zeroTerminated) {
       const len = this.options.length;
       ctx.pushCode(`var ${start} = offset;`);
+      if (ctx.useBounds) {
+        ctx.boundsCheckRange(`${len}`);
+      }
       ctx.pushCode(
         `while(dataView.getUint8(offset++) !== 0 && offset - ${start} < ${len});`,
       );
@@ -1210,8 +1657,14 @@ export class Parser {
           ? `${name} = Array.from(buffer.subarray(${start}, ${end}), ${toHex}).join('');`
           : `${name} = new TextDecoder('${encoding}').decode(buffer.subarray(${start}, ${end}));`,
       );
+      if (ctx.useBounds) {
+        ctx.pushCode(`offset = ${start} + ${len};`);
+      }
     } else if (this.options.length) {
       const len = ctx.generateOption(this.options.length);
+      if (ctx.useBounds) {
+        ctx.boundsCheckRange(`${len}`);
+      }
       ctx.pushCode(
         isHex
           ? `${name} = Array.from(buffer.subarray(offset, offset + ${len}), ${toHex}).join('');`
@@ -1220,7 +1673,16 @@ export class Parser {
       ctx.pushCode(`offset += ${len};`);
     } else if (this.options.zeroTerminated) {
       ctx.pushCode(`var ${start} = offset;`);
-      ctx.pushCode("while(dataView.getUint8(offset++) !== 0);");
+      if (ctx.useBounds) {
+        ctx.pushCode(
+          `while(offset < $frameEnd() && dataView.getUint8(offset++) !== 0);`,
+        );
+        ctx.pushCode(
+          `if (dataView.getUint8(offset - 1) !== 0) $boundedError("unterminated string reached the end of the bounded frame", ${ctx.generatePathExpression()}, offset);`,
+        );
+      } else {
+        ctx.pushCode("while(dataView.getUint8(offset++) !== 0);");
+      }
       ctx.pushCode(
         isHex
           ? `${name} = Array.from(buffer.subarray(${start}, offset - 1), ${toHex}).join('');`
@@ -1228,7 +1690,11 @@ export class Parser {
       );
     } else if (this.options.greedy) {
       ctx.pushCode(`var ${start} = offset;`);
-      ctx.pushCode("while(buffer.length > offset++);");
+      if (ctx.useBounds) {
+        ctx.pushCode("while($frameEnd() > offset++);");
+      } else {
+        ctx.pushCode("while(buffer.length > offset++);");
+      }
       ctx.pushCode(
         isHex
           ? `${name} = Array.from(buffer.subarray(${start}, offset), ${toHex}).join('');`
@@ -1250,7 +1716,9 @@ export class Parser {
 
       ctx.pushCode(`var ${start} = offset;`);
       ctx.pushCode(`var ${cur} = 0;`);
-      ctx.pushCode(`while (offset < buffer.length) {`);
+      ctx.pushCode(
+        `while (offset < ${ctx.useBounds ? "$frameEnd()" : "buffer.length"}) {`,
+      );
       ctx.pushCode(`${cur} = dataView.getUint8(offset);`);
       const func = ctx.addImport(pred);
       ctx.pushCode(
@@ -1260,9 +1728,18 @@ export class Parser {
       ctx.pushCode(`}`);
       ctx.pushCode(`${varName} = buffer.subarray(${start}, offset);`);
     } else if (this.options.readUntil === "eof") {
-      ctx.pushCode(`${varName} = buffer.subarray(offset);`);
+      if (ctx.useBounds) {
+        ctx.pushCode(
+          `${varName} = buffer.subarray(offset, $frameEnd()); offset = $frameEnd();`,
+        );
+      } else {
+        ctx.pushCode(`${varName} = buffer.subarray(offset);`);
+      }
     } else {
       const len = ctx.generateOption(this.options.length!);
+      if (ctx.useBounds) {
+        ctx.boundsCheckRange(`${len}`);
+      }
 
       ctx.pushCode(`${varName} = buffer.subarray(offset, offset + ${len});`);
       ctx.pushCode(`offset += ${len};`);
@@ -1288,11 +1765,40 @@ export class Parser {
     } else {
       ctx.pushCode(`${lhs} = [];`);
     }
+    const ordinal = ctx.useBounds ? ctx.generateTmpVariable() : "";
+    if (ctx.useBounds) {
+      ctx.pushCode(`var ${ordinal} = 0;`);
+      if (
+        typeof this.options.readUntil !== "function" &&
+        this.options.readUntil !== "eof" &&
+        lengthInBytes === undefined
+      ) {
+        // Only guard numeric runtime values; an undefined field reference
+        // keeps the legacy behavior (the loop body never executes). The path
+        // is captured statically because the runtime path is popped before a
+        // thrown error is constructed.
+        const arrayPath = JSON.stringify(ctx.staticPathString());
+        ctx.pushCode(
+          `if (typeof ${length} === "number" && (!Number.isInteger(${length}) || ${length} < 0 || ${length} > Number.MAX_SAFE_INTEGER)) $boundedError("invalid array length " + ${length}, ${arrayPath}, offset);`,
+        );
+      } else if (lengthInBytes !== undefined) {
+        ctx.pushCode(
+          `$checkRange(offset, ${lengthInBytes}, ${JSON.stringify(
+            ctx.staticPathString(),
+          )});`,
+        );
+      }
+    }
     if (typeof this.options.readUntil === "function") {
       ctx.pushCode("do {");
+      if (ctx.useBounds) {
+        ctx.pushCode(`if (offset >= $frameEnd()) break;`);
+      }
     } else if (this.options.readUntil === "eof") {
       ctx.pushCode(
-        `for (var ${counter} = 0; offset < buffer.length; ${counter}++) {`,
+        `for (var ${counter} = 0; offset < ${
+          ctx.useBounds ? "$frameEnd()" : "buffer.length"
+        }; ${counter}++) {`,
       );
     } else if (lengthInBytes !== undefined) {
       ctx.pushCode(
@@ -1303,11 +1809,17 @@ export class Parser {
         `for (var ${counter} = ${length}; ${counter} > 0; ${counter}--) {`,
       );
     }
+    if (ctx.useBounds) {
+      ctx.pushCode(`$pushPath("[" + ${ordinal} + "]");`);
+    }
 
     if (typeof type === "string") {
       if (!aliasRegistry.get(type)) {
         const typeName = PRIMITIVE_NAMES[type as PrimitiveTypes];
         const littleEndian = PRIMITIVE_LITTLE_ENDIANS[type as PrimitiveTypes];
+        if (ctx.useBounds) {
+          ctx.boundsCheckRange(String(PRIMITIVE_SIZES[type as PrimitiveTypes]));
+        }
         ctx.pushCode(
           `var ${item} = dataView.get${typeName}(offset, ${littleEndian});`,
         );
@@ -1323,7 +1835,7 @@ export class Parser {
             ctx.pushCode(`$index: ${length} - ${counter},`);
           }
         }
-        ctx.pushCode(`});`);
+        ctx.pushCode(`}${ctx.useBounds ? ", $frames, $path" : ""});`);
         ctx.pushCode(
           `var ${item} = ${tempVar}.result; offset = ${tempVar}.offset;`,
         );
@@ -1357,6 +1869,10 @@ export class Parser {
     } else {
       ctx.pushCode(`${lhs}.push(${item});`);
     }
+    if (ctx.useBounds) {
+      ctx.pushCode(`$popPath();`);
+      ctx.pushCode(`${ordinal}++;`);
+    }
 
     ctx.pushCode("}");
 
@@ -1379,6 +1895,9 @@ export class Parser {
       if (!aliasRegistry.has(type)) {
         const typeName = PRIMITIVE_NAMES[type as PrimitiveTypes];
         const littleEndian = PRIMITIVE_LITTLE_ENDIANS[type as PrimitiveTypes];
+        if (ctx.useBounds) {
+          ctx.boundsCheckRange(String(PRIMITIVE_SIZES[type as PrimitiveTypes]));
+        }
         ctx.pushCode(
           `${varName} = dataView.get${typeName}(offset, ${littleEndian});`,
         );
@@ -1390,7 +1909,7 @@ export class Parser {
           ctx.pushCode(`$parent: ${varName}.$parent,`);
           ctx.pushCode(`$root: ${varName}.$root,`);
         }
-        ctx.pushCode(`});`);
+        ctx.pushCode(`}${ctx.useBounds ? ", $frames, $path" : ""});`);
         ctx.pushCode(
           `${varName} = ${tempVar}.result; offset = ${tempVar}.offset;`,
         );
@@ -1439,6 +1958,132 @@ export class Parser {
     }
   }
 
+  private generateBounded(ctx: Context) {
+    const nestVar = ctx.generateVariable(this.varName);
+    const startVar = ctx.generateTmpVariable();
+    const endVar = ctx.generateTmpVariable();
+    const lengthExpr = ctx.generateOption(
+      this.options.bounds as number | string | Function,
+    );
+    const consume = this.options.consume ?? "exact";
+    // Path including this frame's own name; used both by the entry range
+    // check and by the consume-policy checks that run after the runtime path
+    // segment has been popped.
+    const framePathVar = ctx.generateTmpVariable();
+
+    ctx.pushCode(`var ${startVar} = offset;`);
+    // The enclosing generate() has already pushed this field's name onto
+    // the runtime path, so capture the path exactly as it is.
+    ctx.pushCode(`var ${framePathVar} = ${ctx.generatePathExpression()};`);
+    ctx.pushCode(`var $boundsLength = (${lengthExpr});`);
+    ctx.pushCode(`var ${endVar} = ${startVar} + $boundsLength;`);
+    ctx.pushCode(
+      `if (typeof $boundsLength !== "number" || !Number.isInteger($boundsLength) || $boundsLength < 0 || $boundsLength > Number.MAX_SAFE_INTEGER) {`,
+    );
+    ctx.boundsErrorAt(
+      framePathVar,
+      "offset",
+      `"invalid bounded length " + $boundsLength + " (must be a non-negative safe integer)"`,
+    );
+    ctx.pushCode(`}`);
+    // Validate the new frame against the *current* (parent) frame/buffer
+    // before pushing it; the reported range is therefore the parent range.
+    ctx.pushCode(`$checkRange(offset, $boundsLength, ${framePathVar});`);
+    ctx.pushCode(`$frames.push([${startVar}, ${endVar}]);`);
+    ctx.pushCode(`try {`);
+
+    if (this.options.type instanceof Parser) {
+      if (this.varName) {
+        ctx.pushCode(`${nestVar} = {};`);
+
+        if (ctx.useContextVariables) {
+          const parentVar = ctx.generateVariable();
+          ctx.pushCode(`${nestVar}.$parent = ${parentVar};`);
+          ctx.pushCode(`${nestVar}.$root = ${parentVar}.$root;`);
+        }
+      }
+
+      ctx.pushPath(this.varName);
+      this.options.type.generate(ctx);
+      ctx.popPath(this.varName);
+
+      if (this.varName && ctx.useContextVariables) {
+        ctx.pushCode(`delete ${nestVar}.$parent;`);
+        ctx.pushCode(`delete ${nestVar}.$root;`);
+      }
+    } else if (aliasRegistry.has(this.options.type!)) {
+      const tempVar = ctx.generateTmpVariable();
+      ctx.pushCode(
+        `var ${tempVar} = ${FUNCTION_PREFIX + this.options.type}(offset, {`,
+      );
+      if (ctx.useContextVariables) {
+        const parentVar = ctx.generateVariable();
+        ctx.pushCode(`$parent: ${parentVar},`);
+        ctx.pushCode(`$root: ${parentVar}.$root,`);
+      }
+      ctx.pushCode(`}, $frames, $path);`);
+      ctx.pushCode(
+        `${nestVar} = ${tempVar}.result; offset = ${tempVar}.offset;`,
+      );
+      if (this.options.type !== this.alias) {
+        ctx.addReference(this.options.type!);
+      }
+    }
+
+    ctx.pushCode(`} catch ($boundedErr) {`);
+    ctx.pushCode(
+      `if ($boundedErr && typeof $boundedErr === "object" && !$boundedErr.$boundedAnnotated) {`,
+    );
+    ctx.pushCode(`$boundedErr.$boundedAnnotated = true;`);
+    ctx.pushCode(`if (!$boundedErr.fieldPath) {`);
+    ctx.pushCode(`$boundedErr.fieldPath = ${ctx.generatePathExpression()};`);
+    ctx.pushCode(`}`);
+    ctx.pushCode(`$boundedErr.rangeStart = ${startVar};`);
+    ctx.pushCode(`$boundedErr.rangeEnd = ${endVar};`);
+    ctx.pushCode(`$boundedErr.consumed = offset - ${startVar};`);
+    ctx.pushCode(`$boundedErr.offset = offset;`);
+    ctx.pushCode(
+      `$boundedErr.message = $boundedErr.message + " (field " + $boundedErr.fieldPath + ", offset " + offset + ", range [" + ${startVar} + ", " + ${endVar} + "], consumed " + (offset - ${startVar}) + ")";`,
+    );
+    ctx.pushCode(`}`);
+    ctx.pushCode(`throw $boundedErr;`);
+    ctx.pushCode(`} finally {`);
+    ctx.pushCode(`$frames.pop();`);
+    ctx.pushCode(`}`);
+
+    ctx.pushCode(`var $consumed = offset - ${startVar};`);
+
+    const exactReason = `$consumed === 0 ? "empty sub-parser consumed no bytes" : ($consumed < $boundsLength ? "sub-parser consumed only " + $consumed + " of " + $boundsLength + " byte(s)" : "sub-parser consumed " + $consumed + " byte(s), exceeding the bounded length " + $boundsLength)`;
+    const overReason = `"sub-parser consumed " + $consumed + " byte(s), exceeding the bounded length " + $boundsLength`;
+    if (consume === "exact") {
+      ctx.pushCode(`if (offset !== ${endVar}) {`);
+      ctx.boundsErrorAt(framePathVar, "offset", exactReason, `$consumed`);
+      ctx.pushCode(`}`);
+    } else if (consume === "allow-trailing") {
+      ctx.pushCode(`if (offset < ${endVar}) { offset = ${endVar}; }`);
+      ctx.pushCode(`if (offset > ${endVar}) {`);
+      ctx.boundsErrorAt(framePathVar, "offset", overReason, `$consumed`);
+      ctx.pushCode(`}`);
+    } else {
+      // keep-trailing
+      const trailingSegments: string[] = [];
+      for (const scope of ctx.scopes) {
+        trailingSegments.push(...scope);
+      }
+      if (this.varName) {
+        trailingSegments.push(this.varName);
+      }
+      trailingSegments.push(this.options.trailing!);
+      const trailingName = trailingSegments.join(".");
+      ctx.pushCode(`if (offset <= ${endVar}) {`);
+      ctx.pushCode(`${trailingName} = buffer.subarray(offset, ${endVar});`);
+      ctx.pushCode(`offset = ${endVar};`);
+      ctx.pushCode(`} else {`);
+      ctx.boundsErrorAt(framePathVar, "offset", overReason, `$consumed`);
+      ctx.pushCode(`}`);
+    }
+  }
+
   private generateNest(ctx: Context) {
     const nestVar = ctx.generateVariable(this.varName);
 
@@ -1473,7 +2118,7 @@ export class Parser {
         ctx.pushCode(`$parent: ${parentVar},`);
         ctx.pushCode(`$root: ${parentVar}.$root,`);
       }
-      ctx.pushCode(`});`);
+      ctx.pushCode(`}${ctx.useBounds ? ", $frames, $path" : ""});`);
       ctx.pushCode(
         `${nestVar} = ${tempVar}.result; offset = ${tempVar}.offset;`,
       );
@@ -1493,7 +2138,9 @@ export class Parser {
 
       ctx.pushCode(`var ${start} = offset;`);
       ctx.pushCode(`var ${cur} = 0;`);
-      ctx.pushCode(`while (offset < buffer.length) {`);
+      ctx.pushCode(
+        `while (offset < ${ctx.useBounds ? "$frameEnd()" : "buffer.length"}) {`,
+      );
       ctx.pushCode(`${cur} = dataView.getUint8(offset);`);
       const func = ctx.addImport(pred);
       ctx.pushCode(
@@ -1503,9 +2150,18 @@ export class Parser {
       ctx.pushCode(`}`);
       ctx.pushCode(`${wrappedBuf} = buffer.subarray(${start}, offset);`);
     } else if (this.options.readUntil === "eof") {
-      ctx.pushCode(`${wrappedBuf} = buffer.subarray(offset);`);
+      if (ctx.useBounds) {
+        ctx.pushCode(
+          `${wrappedBuf} = buffer.subarray(offset, $frameEnd()); offset = $frameEnd();`,
+        );
+      } else {
+        ctx.pushCode(`${wrappedBuf} = buffer.subarray(offset);`);
+      }
     } else {
       const len = ctx.generateOption(this.options.length!);
+      if (ctx.useBounds) {
+        ctx.boundsCheckRange(`${len}`);
+      }
       ctx.pushCode(`${wrappedBuf} = buffer.subarray(offset, offset + ${len});`);
       ctx.pushCode(`offset += ${len};`);
     }
@@ -1524,11 +2180,22 @@ export class Parser {
     ctx.pushCode(`var ${tempBuf} = buffer;`);
     ctx.pushCode(`var ${tempOff} = offset;`);
     ctx.pushCode(`var ${tempView} = dataView;`);
+    const tempFrames = ctx.useBounds ? ctx.generateTmpVariable() : "";
+    const tempPath = ctx.useBounds ? ctx.generateTmpVariable() : "";
+    if (ctx.useBounds) {
+      ctx.pushCode(`var ${tempFrames} = $frames;`);
+      ctx.pushCode(`var ${tempPath} = $path;`);
+      ctx.pushCode(`$frames = [];`);
+      ctx.pushCode(`$path = [];`);
+    }
     ctx.pushCode(`buffer = ${wrappedBuf};`);
     ctx.pushCode(`offset = 0;`);
     ctx.pushCode(
       `dataView = new DataView(buffer.buffer, buffer.byteOffset, buffer.length);`,
     );
+    if (ctx.useBounds) {
+      ctx.pushCode(`try {`);
+    }
     if (this.options.type instanceof Parser) {
       if (this.varName) {
         ctx.pushCode(`${wrapperVar} = {};`);
@@ -1539,12 +2206,20 @@ export class Parser {
     } else if (aliasRegistry.has(this.options.type!)) {
       const tempVar = ctx.generateTmpVariable();
       ctx.pushCode(
-        `var ${tempVar} = ${FUNCTION_PREFIX + this.options.type}(0);`,
+        `var ${tempVar} = ${FUNCTION_PREFIX + this.options.type}(0, undefined${
+          ctx.useBounds ? ", $frames, $path" : ""
+        });`,
       );
       ctx.pushCode(`${wrapperVar} = ${tempVar}.result;`);
       if (this.options.type !== this.alias) {
         ctx.addReference(this.options.type!);
       }
+    }
+    if (ctx.useBounds) {
+      ctx.pushCode(`} finally {`);
+      ctx.pushCode(`$frames = ${tempFrames};`);
+      ctx.pushCode(`$path = ${tempPath};`);
+      ctx.pushCode(`}`);
     }
     ctx.pushCode(`buffer = ${tempBuf};`);
     ctx.pushCode(`dataView = ${tempView};`);
@@ -1569,12 +2244,31 @@ export class Parser {
     const offset = ctx.generateOption(this.options.offset!);
     const tempVar = ctx.generateTmpVariable();
     const nestVar = ctx.generateVariable(this.varName);
+    const isRelative = this.options.relative === true;
 
     // Save current offset
     ctx.pushCode(`var ${tempVar} = offset;`);
 
-    // Move offset
-    ctx.pushCode(`offset = ${offset};`);
+    if (ctx.useBounds) {
+      if (isRelative) {
+        // Relative pointer: the offset option is added to the current
+        // position; the resulting target must stay inside the active frame.
+        ctx.pushCode(`offset = offset + (${offset});`);
+      } else {
+        // Absolute pointer: contract says "from the beginning of the input
+        // buffer", but under a bounded frame the target is constrained to
+        // the active frame and interpreted relative to its base.
+        ctx.pushCode(`offset = $frameBase() + (${offset});`);
+      }
+      ctx.boundsCheckPointer("offset");
+    } else {
+      // Move offset
+      if (isRelative) {
+        ctx.pushCode(`offset = offset + (${offset});`);
+      } else {
+        ctx.pushCode(`offset = ${offset};`);
+      }
+    }
 
     if (this.options.type instanceof Parser) {
       ctx.pushCode(`${nestVar} = {};`);
@@ -1603,7 +2297,7 @@ export class Parser {
         ctx.pushCode(`$parent: ${parentVar},`);
         ctx.pushCode(`$root: ${parentVar}.$root,`);
       }
-      ctx.pushCode(`});`);
+      ctx.pushCode(`}${ctx.useBounds ? ", $frames, $path" : ""});`);
       ctx.pushCode(
         `${nestVar} = ${tempVar}.result; offset = ${tempVar}.offset;`,
       );
@@ -1613,6 +2307,9 @@ export class Parser {
     } else if (Object.keys(PRIMITIVE_SIZES).indexOf(this.options.type!) >= 0) {
       const typeName = PRIMITIVE_NAMES[type as PrimitiveTypes];
       const littleEndian = PRIMITIVE_LITTLE_ENDIANS[type as PrimitiveTypes];
+      if (ctx.useBounds) {
+        ctx.boundsCheckRange(String(PRIMITIVE_SIZES[type as PrimitiveTypes]));
+      }
       ctx.pushCode(
         `${nestVar} = dataView.get${typeName}(offset, ${littleEndian});`,
       );

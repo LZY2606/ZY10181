@@ -23,6 +23,8 @@ time and effort to write). Supported data types are:
 - [Arrays](#arrayname-options) (fixed-length and variable-length arrays of
   builtin or user-defined element types)
 - [Choices](#choicename-options) (supports integer keys)
+- [Bounded sub-parsers](#boundedname-options) (length-delimited nested
+  ranges with enforced boundaries)
 - [Pointers](#pointername-options)
 - User defined types (arbitrary combination of builtin types)
 
@@ -292,6 +294,99 @@ current object. `options` is an object which can have the following keys:
 
 - `type` - (Required) A `Parser` object.
 
+### bounded([name,] options)
+
+Execute an inner parser inside an explicit, declarative **bounded frame**:
+a half-open byte range `[currentOffset, currentOffset + length)` that starts
+at the current position. Unlike slicing the input buffer by hand, the frame
+is enforced directly inside the generated code, so every read performed by
+the inner parser is bounds-checked against the frame. When the frame exits,
+the parent bounds are restored.
+
+- `type` - (Required) A `Parser` object or the name of a registered
+  ([`namely`](#namelyalias)) parser.
+- `bounds` - (Required) The length of the frame. It can be:
+  - a non-negative safe integer constant,
+  - a string naming a previously parsed field,
+  - a function `(vars) => number` receiving the object parsed so far (the
+    same object `this` refers to in other callbacks); it must return a
+    non-negative safe integer,
+  - an options object `{ length, consume, trailing }` where `length` is one
+    of the three forms above.
+- `consume` - (Optional, defaults to `"exact"`) Controls how many bytes the
+  inner parser must consume:
+  - `"exact"` - the inner parser must consume exactly the whole frame; an
+    error is thrown when it stops short of or runs past the end.
+  - `"allow-trailing"` - unconsumed trailing bytes are skipped; the outer
+    parser continues right after the frame. Running past the end is still an
+    error.
+  - `"keep-trailing"` - unconsumed trailing bytes are stored in the field
+    named by `trailing` (a view of the original input, not a copy) and the
+    outer parser continues after the frame. Requires `trailing`.
+
+Note that [`pointer`](#pointername-options) always rewinds the offset after
+executing its `type`, so a frame whose inner parser contains only pointers
+does not advance through the frame; pair pointers with other fields (or use
+`"allow-trailing"` / `"keep-trailing"`) in that case.
+
+```javascript
+const parser = new Parser()
+  .uint32le("length")
+  .bounded("payload", {
+    type: new Parser()
+      .uint16le("id")
+      .array("items", { type: "uint8", length: 2 }),
+    bounds: {
+      length: "length", // or a constant or function
+      consume: "keep-trailing",
+      trailing: "padding",
+    },
+  })
+  .uint8("after");
+
+const result = parser.parse(
+  // 4-byte length prefix, then the 6-byte frame, then the trailing byte
+  Buffer.from([
+    0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0a, 0x0b, 0xcc, 0x00, 0x09,
+  ]),
+);
+// { length: 6,
+//   payload: { id: 1, items: [10, 11], padding: <Buffer cc 00> },
+//   after: 9 }
+```
+
+**Pointer semantics inside a frame.** Both absolute and relative pointers
+are constrained to the frame that is active when they execute:
+
+- Absolute pointers (`offset` as a number, field name or function) keep
+  their original "offset from the beginning" contract, but the beginning is
+  the base of the active bounded frame rather than the whole input buffer.
+- Relative pointers use `offset` as a delta added to the current position
+  (`pointer(name, { type, offset, relative: true })`). The resolved target
+  must remain inside the active frame.
+- Nested frames are independent: a pointer in an inner frame cannot address
+  bytes of the parent frame, and the parent bounds are restored as soon as
+  the inner frame exits.
+
+**Errors.** Invalid lengths (negative, fractional, non-finite, above
+`Number.MAX_SAFE_INTEGER`), truncated frames, reads crossing a frame
+boundary and pointers leaving a frame throw an `Error`. In addition to the
+message, the error carries `fieldPath` (dotted path of the field, including
+array indices), `offset` (absolute offset at the failure), `rangeStart` /
+`rangeEnd` (the active frame range, or the whole buffer at the top level)
+and `consumed` (bytes consumed from the start of the active frame). Errors
+thrown by `assert` predicates or `formatter` functions are annotated with
+the same context. Frames are torn down with `try/finally` in the generated
+code, so a failure never leaves the bounds or field-path stack polluted and
+re-parsing with the same `Parser` instance yields consistent results.
+
+**Complexity and compatibility.** The bounds and path state are plain
+local variables in the generated function (a small frame stack and a path
+segment stack); each bounded frame adds constant bookkeeping plus one range
+check per inner read, i.e. O(1) overhead per parsed field and O(depth) stack
+space for nested frames. Parsers that do not use `bounded` generate
+byte-for-byte identical code and keep their previous behavior.
+
 ### pointer(name [,options])
 Jump to `offset`, execute parser for `type` and rewind to previous offset.
 Useful for parsing binary formats such as ELF where the offset of a field is
@@ -300,7 +395,11 @@ pointed by another field.
 - `type` - (Required) Can be a string `[u]int{8, 16, 32, 64}{le, be}`
    or a user defined `Parser` object.
 - `offset` - (Required) Indicates absolute offset from the beginning of the
-  input buffer. Can be a number, string or a function.
+  input buffer (or the base of the active frame when parsed inside a
+  [`bounded`](#boundedname-options) range). Can be a number, string or a
+  function. Add `relative: true` to interpret `offset` as a delta from the
+  current position. In both cases the resolved target must stay inside the
+  active bounded frame.
 
 ### saveOffset(name [,options])
 Save the current buffer offset as key `name`. This function is only useful
