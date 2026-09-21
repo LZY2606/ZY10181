@@ -24,6 +24,8 @@ time and effort to write). Supported data types are:
   builtin or user-defined element types)
 - [Choices](#choicename-options) (supports integer keys)
 - [Pointers](#pointername-options)
+- [Bounded sub-parsers](#boundedname-options) (length-delimited nested
+  parsers with enforced boundaries)
 - User defined types (arbitrary combination of builtin types)
 
 Binary-parser was inspired by [BinData](https://github.com/dmendel/bindata)
@@ -292,6 +294,71 @@ current object. `options` is an object which can have the following keys:
 
 - `type` - (Required) A `Parser` object.
 
+### bounded([name,] options)
+Execute an inner parser inside a length-delimited sub-region of the input
+buffer, and store its result to key `name`. If `name` is omitted, the result
+of the inner parser is directly embedded into the current object. This is
+useful for container formats (chunks, TLV records, length-prefixed frames)
+where a sub-structure must be parsed within an explicit byte range: the
+caller no longer needs to slice the buffer by hand, and inner `pointer` and
+`seek` operations are prevented from escaping the region.
+
+`options` is an object which can have the following keys:
+
+- `length` - (Required) Size of the sub-region in bytes. Can be a number, the
+  name of a previously parsed field, or a function called with the fields
+  parsed so far as `this`. The resolved value must be a non-negative safe
+  integer; zero is allowed and parses an empty region.
+- `type` - (Required) A `Parser` object or the name of a parser registered
+  with `namely()`.
+- `trailing` - (Optional) What to do when the inner parser does not consume
+  the whole region. One of:
+  - `"error"` (default) - throw if the inner parser did not consume exactly
+    `length` bytes.
+  - `"skip"` - advance past the remaining bytes.
+  - `"preserve"` - store the remaining bytes as a `Uint8Array` view (no copy)
+    under the key given by `trailingVarName` and advance past them.
+- `trailingVarName` - (Required when `trailing` is `"preserve"`) Name of the
+  field that receives the trailing bytes. The field is stored next to `name`
+  in the current scope.
+
+```javascript
+const parser = new Parser()
+  .uint16("payloadLength")
+  .bounded("payload", {
+    length: "payloadLength",
+    type: new Parser().uint8("type").uint16be("value"),
+    trailing: "preserve",
+    trailingVarName: "unparsed"
+  });
+```
+
+Semantics and boundary enforcement:
+
+- The sub-region starts at the current offset and spans `length` bytes. If
+  the region extends past the end of the enclosing region (the buffer itself
+  or the parent `bounded` frame), parsing fails before the inner parser runs.
+- While a `bounded` frame is active, absolute `pointer` offsets and relative
+  `seek` displacements must stay inside the innermost frame; violating
+  accesses throw an error. Frames can be nested arbitrarily, and the parent
+  boundary is restored when a frame exits, even if the inner parser threw
+  (the frame stack is unwound with `try/finally`, so a failed parse never
+  poisons subsequent `parse` calls on the same `Parser` instance).
+- Errors thrown by `bounded` carry a descriptive message plus structured
+  properties: `fieldPath` (dotted path of the field), `absoluteOffset`
+  (offset in the input buffer), `bounds` (the `[start, end]` pair of the
+  region) and `consumed` (bytes consumed by the inner parser).
+
+Complexity and compatibility:
+
+- Boundary tracking is O(1) per frame: the generated code keeps a stack of
+  `[start, end]` pairs and never copies or slices the buffer, except for the
+  trailing view created by `trailing: "preserve"`.
+- The boundary stack and the `pointer`/`seek` checks are only emitted when
+  the parser (or one of its nested or aliased sub-parsers) actually uses
+  `bounded`. Parsers that never use `bounded` generate exactly the same code
+  and behave exactly as before.
+
 ### pointer(name [,options])
 Jump to `offset`, execute parser for `type` and rewind to previous offset.
 Useful for parsing binary formats such as ELF where the offset of a field is
@@ -301,6 +368,10 @@ pointed by another field.
    or a user defined `Parser` object.
 - `offset` - (Required) Indicates absolute offset from the beginning of the
   input buffer. Can be a number, string or a function.
+
+When the parser contains a [bounded](#boundedname-options) frame, the
+resolved offset must lie inside the currently active bounded region;
+otherwise an error is thrown.
 
 ### saveOffset(name [,options])
 Save the current buffer offset as key `name`. This function is only useful
@@ -332,6 +403,10 @@ const parser = new Parser()
 Move the buffer offset for `relOffset` bytes from the current position. Use a
 negative `relOffset` value to rewind the offset. This method was previously
 named `skip(length)`.
+
+When the parser contains a [bounded](#boundedname-options) frame, the
+resulting offset must stay inside the currently active bounded region;
+otherwise an error is thrown.
 
 ### endianness(endianness)
 Define what endianness to use in this parser. `endianness` can be either

@@ -8,6 +8,7 @@ class Context {
   imports: any[] = [];
   reverseImports = new Map<any, number>();
   useContextVariables = false;
+  usesBounded = false;
 
   constructor(importPath: string, useContextVariables: boolean) {
     this.importPath = importPath;
@@ -21,6 +22,22 @@ class Context {
     }
 
     return scopes.join(".");
+  }
+
+  generatePath(name?: string): string {
+    const scopes: string[] = [];
+    for (const scope of this.scopes) {
+      for (const item of scope) {
+        if (item !== "vars") {
+          scopes.push(item);
+        }
+      }
+    }
+    if (name) {
+      scopes.push(name);
+    }
+
+    return scopes.join(".") || "(root)";
   }
 
   generateOption(val: number | string | Function): string {
@@ -128,6 +145,8 @@ interface ParserOptions {
   tag?: string | ((item: any) => number);
   offset?: number | string | ((item: any) => number);
   wrapper?: (buffer: Buffer) => Buffer;
+  trailing?: "error" | "skip" | "preserve";
+  trailingVarName?: string;
 }
 
 type Types = PrimitiveTypes | ComplexTypes;
@@ -139,6 +158,7 @@ type ComplexTypes =
   | "array"
   | "choice"
   | "nest"
+  | "bounded"
   | "seek"
   | "pointer"
   | "saveOffset"
@@ -730,6 +750,51 @@ export class Parser {
     return this.setNextParser("nest", varName as string, options);
   }
 
+  bounded(varName: string | ParserOptions, options?: ParserOptions): this {
+    if (typeof options !== "object" && typeof varName === "object") {
+      options = varName;
+      varName = "";
+    }
+
+    if (!options || options.length == null) {
+      throw new Error("length is required for bounded.");
+    }
+
+    if (!options.type) {
+      throw new Error("type is required for bounded.");
+    }
+
+    if (!(options.type instanceof Parser) && !aliasRegistry.has(options.type)) {
+      throw new Error("type must be a known parser name or a Parser object.");
+    }
+
+    if (!(options.type instanceof Parser) && !varName) {
+      throw new Error(
+        "type must be a Parser object if the variable name is omitted.",
+      );
+    }
+
+    const trailing = options.trailing ?? "error";
+    if (
+      trailing !== "error" &&
+      trailing !== "skip" &&
+      trailing !== "preserve"
+    ) {
+      throw new Error('trailing must be one of "error", "skip" or "preserve".');
+    }
+
+    if (trailing === "preserve") {
+      if (!options.trailingVarName) {
+        throw new Error(
+          'trailingVarName is required when trailing is "preserve".',
+        );
+      }
+      this.sanitizeFieldName(options.trailingVarName);
+    }
+
+    return this.setNextParser("bounded", varName as string, options);
+  }
+
   pointer(varName: string, options: ParserOptions): this {
     if (options.offset == null) {
       throw new Error("offset is required for pointer.");
@@ -791,10 +856,25 @@ export class Parser {
 
   private getContext(importPath: string): Context {
     const ctx = new Context(importPath, this.useContextVariables);
+    ctx.usesBounded = this.hasBounded();
 
     ctx.pushCode(
       "var dataView = new DataView(buffer.buffer, buffer.byteOffset, buffer.length);",
     );
+
+    if (ctx.usesBounded) {
+      ctx.pushCode("var $bounds = [[0, buffer.length]];");
+      ctx.pushCode(
+        "function $boundedError(message, fieldPath, absoluteOffset, start, end, consumed) {",
+      );
+      ctx.pushCode("var error = new Error(message);");
+      ctx.pushCode("error.fieldPath = fieldPath;");
+      ctx.pushCode("error.absoluteOffset = absoluteOffset;");
+      ctx.pushCode("error.bounds = [start, end];");
+      ctx.pushCode("error.consumed = consumed;");
+      ctx.pushCode("return error;");
+      ctx.pushCode("}");
+    }
 
     if (!this.alias) {
       this.addRawCode(ctx);
@@ -804,6 +884,48 @@ export class Parser {
     }
 
     return ctx;
+  }
+
+  // Detect whether this parser chain (including nested and aliased
+  // sub-parsers) contains a bounded parser, so that the bounds stack and
+  // boundary checks are only emitted when actually needed. This keeps the
+  // generated code identical for parsers that never use bounded.
+  private hasBounded(seen: Set<Parser> = new Set()): boolean {
+    if (seen.has(this)) {
+      return false;
+    }
+    seen.add(this);
+
+    for (let parser: Parser | undefined = this; parser; parser = parser.next) {
+      if (parser.type === "bounded") {
+        return true;
+      }
+
+      const types: (string | Parser)[] = [];
+      if (parser.options.type) {
+        types.push(parser.options.type);
+      }
+      if (parser.options.choices) {
+        types.push(...Object.values(parser.options.choices));
+      }
+      if (parser.options.defaultChoice) {
+        types.push(parser.options.defaultChoice);
+      }
+
+      for (const type of types) {
+        if (type instanceof Parser) {
+          if (type.hasBounded(seen)) {
+            return true;
+          }
+        } else if (aliasRegistry.has(type)) {
+          if (aliasRegistry.get(type)!.hasBounded(seen)) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
   }
 
   getCode(): string {
@@ -908,6 +1030,13 @@ export class Parser {
     } else if (this.type === "seek") {
       size = this.options.length as number;
 
+      // if this is a fixed length bounded sub-parser
+    } else if (
+      this.type === "bounded" &&
+      typeof this.options.length === "number"
+    ) {
+      size = this.options.length;
+
       // if this is a nested parser
     } else if (this.type === "nest") {
       size = (this.options.type as Parser).sizeOf();
@@ -991,6 +1120,9 @@ export class Parser {
           break;
         case "nest":
           this.generateNest(ctx);
+          break;
+        case "bounded":
+          this.generateBounded(ctx);
           break;
         case "array":
           this.generateArray(ctx);
@@ -1189,6 +1321,19 @@ export class Parser {
   private generateSeek(ctx: Context) {
     const length = ctx.generateOption(this.options.length!);
     ctx.pushCode(`offset += ${length};`);
+
+    if (ctx.usesBounded) {
+      const frame = ctx.generateTmpVariable();
+      const path = ctx.generatePath();
+      ctx.pushCode(`var ${frame} = $bounds[$bounds.length - 1];`);
+      ctx.pushCode(`if (offset < ${frame}[0] || offset > ${frame}[1]) {`);
+      ctx.pushCode(
+        `throw $boundedError("seek moved the offset of '${path}' to " + offset + ", which is outside the current bounded range [" + ${frame}[0] + ", " + ${frame}[1] + ")", ${JSON.stringify(
+          path,
+        )}, offset, ${frame}[0], ${frame}[1], 0);`,
+      );
+      ctx.pushCode("}");
+    }
   }
 
   private generateString(ctx: Context) {
@@ -1483,6 +1628,105 @@ export class Parser {
     }
   }
 
+  private generateBounded(ctx: Context) {
+    const nestVar = ctx.generateVariable(this.varName);
+    const path = ctx.generatePath(this.varName);
+    const length = ctx.generateTmpVariable();
+    const start = ctx.generateTmpVariable();
+    const end = ctx.generateTmpVariable();
+    const frame = ctx.generateTmpVariable();
+    const trailing = this.options.trailing ?? "error";
+
+    ctx.pushCode(
+      `var ${length} = ${ctx.generateOption(this.options.length!)};`,
+    );
+    ctx.pushCode(`if (!Number.isSafeInteger(${length}) || ${length} < 0) {`);
+    ctx.pushCode(
+      `throw $boundedError("Invalid length " + ${length} + " for bounded field '${path}'", ${JSON.stringify(
+        path,
+      )}, offset, offset, offset, 0);`,
+    );
+    ctx.pushCode("}");
+    ctx.pushCode(`var ${start} = offset;`);
+    ctx.pushCode(`var ${end} = ${start} + ${length};`);
+    ctx.pushCode(`var ${frame} = $bounds[$bounds.length - 1];`);
+    ctx.pushCode(`if (${end} > ${frame}[1]) {`);
+    ctx.pushCode(
+      `throw $boundedError("Bounded field '${path}' range [" + ${start} + ", " + ${end} + ") exceeds enclosing range [" + ${frame}[0] + ", " + ${frame}[1] + ")", ${JSON.stringify(
+        path,
+      )}, ${start}, ${start}, ${end}, 0);`,
+    );
+    ctx.pushCode("}");
+    ctx.pushCode(`$bounds.push([${start}, ${end}]);`);
+    ctx.pushCode("try {");
+
+    if (this.options.type instanceof Parser) {
+      if (this.varName) {
+        ctx.pushCode(`${nestVar} = {};`);
+
+        if (ctx.useContextVariables) {
+          const parentVar = ctx.generateVariable();
+          ctx.pushCode(`${nestVar}.$parent = ${parentVar};`);
+          ctx.pushCode(`${nestVar}.$root = ${parentVar}.$root;`);
+        }
+      }
+
+      ctx.pushPath(this.varName);
+      this.options.type.generate(ctx);
+      ctx.popPath(this.varName);
+
+      if (this.varName && ctx.useContextVariables) {
+        ctx.pushCode(`delete ${nestVar}.$parent;`);
+        ctx.pushCode(`delete ${nestVar}.$root;`);
+      }
+    } else if (aliasRegistry.has(this.options.type!)) {
+      const tempVar = ctx.generateTmpVariable();
+      ctx.pushCode(
+        `var ${tempVar} = ${FUNCTION_PREFIX + this.options.type}(offset, {`,
+      );
+      if (ctx.useContextVariables) {
+        const parentVar = ctx.generateVariable();
+        ctx.pushCode(`$parent: ${parentVar},`);
+        ctx.pushCode(`$root: ${parentVar}.$root,`);
+      }
+      ctx.pushCode(`});`);
+      ctx.pushCode(
+        `${nestVar} = ${tempVar}.result; offset = ${tempVar}.offset;`,
+      );
+      if (this.options.type !== this.alias) {
+        ctx.addReference(this.options.type!);
+      }
+    }
+
+    ctx.pushCode("} finally {");
+    ctx.pushCode("$bounds.pop();");
+    ctx.pushCode("}");
+
+    ctx.pushCode(`if (offset > ${end}) {`);
+    ctx.pushCode(
+      `throw $boundedError("Bounded field '${path}' consumed " + (offset - ${start}) + " bytes, which exceeds its range [" + ${start} + ", " + ${end} + ")", ${JSON.stringify(
+        path,
+      )}, offset, ${start}, ${end}, offset - ${start});`,
+    );
+    ctx.pushCode("}");
+
+    if (trailing === "error") {
+      ctx.pushCode(`if (offset !== ${end}) {`);
+      ctx.pushCode(
+        `throw $boundedError("Bounded field '${path}' must consume exactly " + (${end} - ${start}) + " bytes in range [" + ${start} + ", " + ${end} + ") but consumed " + (offset - ${start}), ${JSON.stringify(
+          path,
+        )}, offset, ${start}, ${end}, offset - ${start});`,
+      );
+      ctx.pushCode("}");
+    } else if (trailing === "skip") {
+      ctx.pushCode(`offset = ${end};`);
+    } else if (trailing === "preserve") {
+      const restVar = ctx.generateVariable(this.options.trailingVarName);
+      ctx.pushCode(`${restVar} = buffer.subarray(offset, ${end});`);
+      ctx.pushCode(`offset = ${end};`);
+    }
+  }
+
   private generateWrapper(ctx: Context) {
     const wrapperVar = ctx.generateVariable(this.varName);
     const wrappedBuf = ctx.generateTmpVariable();
@@ -1575,6 +1819,19 @@ export class Parser {
 
     // Move offset
     ctx.pushCode(`offset = ${offset};`);
+
+    if (ctx.usesBounded) {
+      const frame = ctx.generateTmpVariable();
+      const path = ctx.generatePath(this.varName);
+      ctx.pushCode(`var ${frame} = $bounds[$bounds.length - 1];`);
+      ctx.pushCode(`if (offset < ${frame}[0] || offset > ${frame}[1]) {`);
+      ctx.pushCode(
+        `throw $boundedError("Pointer '${path}' points to offset " + offset + ", which is outside the current bounded range [" + ${frame}[0] + ", " + ${frame}[1] + ")", ${JSON.stringify(
+          path,
+        )}, offset, ${frame}[0], ${frame}[1], 0);`,
+      );
+      ctx.pushCode("}");
+    }
 
     if (this.options.type instanceof Parser) {
       ctx.pushCode(`${nestVar} = {};`);
